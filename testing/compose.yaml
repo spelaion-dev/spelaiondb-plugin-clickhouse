@@ -1,0 +1,39 @@
+# The server this plugin's tests run against: the same ClickHouse as in SpelaionDB's repository,
+# plus HTTPS.
+#
+# ClickHouse 25.8 (an LTS release). HTTP is published on 127.0.0.1:18123
+# (SPELAION_TEST_CLICKHOUSE) and HTTPS on 127.0.0.1:18443 (SPELAION_TEST_CLICKHOUSE_HTTPS), with
+# the certificate `testing/gen-keys.sh` makes first. User, password and database: `spelaion`.
+name: spelaiondb-plugin-clickhouse-test
+
+services:
+  clickhouse:
+    image: clickhouse/clickhouse-server:25.8
+    environment:
+      CLICKHOUSE_USER: spelaion
+      CLICKHOUSE_PASSWORD: spelaion
+      CLICKHOUSE_DB: spelaion
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+    ports:
+      - "127.0.0.1:18123:8123"
+      - "127.0.0.1:18443:8443"
+    volumes:
+      - ./clickhouse/tls.xml:/etc/clickhouse-server/config.d/tls.xml:ro
+      - ./keys/server.crt:/certs/server.crt:ro
+      - ./keys/server.key:/certs/server.key:ro
+    # The key is copied inside with the owner and permissions the server can read: a key made
+    # on Linux is the owner's only, and the server runs as its own user.
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        install -o clickhouse -g clickhouse -m 600 /certs/server.key /etc/clickhouse-server/server.key
+        install -o clickhouse -g clickhouse -m 644 /certs/server.crt /etc/clickhouse-server/server.crt
+        exec /entrypoint.sh
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8123/ping || exit 1"]
+      interval: 2s
+      retries: 60
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
