@@ -3,7 +3,7 @@
 
 # The plugin protocol this plugin speaks.
 protocol = "1.0"
-# The engines it serves, by the name SpelaionDB's configuration uses (`engine = "example"`).
-engines = ["example"]
+# The engines it serves, by the name SpelaionDB's configuration uses (`engine = "clickhouse"`).
+engines = ["clickhouse"]
 # The lowest SpelaionDB it works with.
 min_app = "0.10.0"
