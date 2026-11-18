@@ -21,7 +21,10 @@ says only what is different in this repository.
     connection, never a new empty session (SpelaionDB's read-only barrier on ClickHouse is the
     session's `readonly` setting: it must never vanish silently). The session's requests go one
     at a time through an actor; a cancel is `KILL QUERY` by `query_id` on a connection of its
-    own, repeated until the statement's request ends.
+    own, repeated until the statement's request ends. The server holds the session until it
+    has ended a request, so a response is always read to its end before the next request,
+    even one nobody reads any more (killed, then drained): a connection dropped halfway lets
+    the next request race the server and be refused with `SESSION_IS_LOCKED`.
   - `tsv.rs` and `types.rs`: results come as `TabSeparatedWithNamesAndTypes`, the server's own
     text for each value (escaped once, except arrays, tuples and maps, which write their own
     quoted text). An exception after the result started is the `__exception__` marker and a cut

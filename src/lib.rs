@@ -11,7 +11,9 @@
 //! The session's requests go one at a time, through an actor ([`actor`]): ClickHouse refuses a
 //! second request on a session while one runs. A cancel goes on a connection of its own, as
 //! `KILL QUERY` on the running statement's `query_id`, repeated until that statement has ended
-//! (a `KILL` that arrives before the statement is registered finds nothing).
+//! (a `KILL` that arrives before the statement is registered finds nothing). The server holds
+//! the session until it has ended a request, so every answer is read to its end before the next
+//! request goes out, even one nobody reads any more: it is killed, then drained.
 //!
 //! Results come as `TabSeparatedWithNamesAndTypes` ([`tsv`], [`types`]): the server's own text
 //! for every value, read as it arrives and handed on in Arrow batches.
@@ -59,6 +61,9 @@ const TOUCH_EVERY: Duration = Duration::from_secs(25);
 /// How often a cancel repeats its `KILL QUERY`, and for how long at most.
 const KILL_EVERY: Duration = Duration::from_millis(200);
 const KILL_FOR: Duration = Duration::from_secs(30);
+
+/// The most a stopped statement's answer is read for, once nobody wants it.
+const ABANDONED_FOR: Duration = Duration::from_secs(10);
 
 /// The most an internal query's result may take.
 const MAX_ROWS_BODY: usize = 256 * 1024 * 1024;
@@ -474,9 +479,14 @@ impl Run<'_> {
                     match reader.push(&data) {
                         Ok(out) => {
                             if !send_all(&events, out).await {
-                                // Nobody reads the result any more: the statement stops.
+                                // Nobody reads the result any more: the statement stops, and
+                                // its answer is read to its end before the next request. The
+                                // server holds the session until it has ended this request; a
+                                // connection dropped here would have the next request race
+                                // that (SDB-359).
                                 killer.start();
-                                killer.finish().await;
+                                drain(&mut body).await;
+                                killer.stop();
                                 return;
                             }
                         }
@@ -579,14 +589,17 @@ impl Killer {
             let _ = stop.send(());
         }
     }
+}
 
-    /// Lets the `KILL`s run their course: the statement's request was dropped, so nothing says
-    /// when it ends.
-    async fn finish(&mut self) {
-        if let Some((task, _stop)) = self.task.take() {
-            let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
-        }
-    }
+/// Reads what is left of an answer nobody wants, until the server ends it, for
+/// [`ABANDONED_FOR`] at most: the `KILL`s stop it long before that. Past it the connection is
+/// dropped, and a statement that the server has still not ended may hold the session for the
+/// next request, which the server then refuses (`SESSION_IS_LOCKED`), without running it.
+async fn drain(body: &mut Incoming) {
+    let _ = tokio::time::timeout(ABANDONED_FOR, async {
+        while let Some(Ok(_)) = body.frame().await {}
+    })
+    .await;
 }
 
 /// A statement's result, read as its bytes arrive.

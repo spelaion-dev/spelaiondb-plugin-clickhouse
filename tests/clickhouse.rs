@@ -472,6 +472,79 @@ async fn a_cancel_stops_the_statement_that_runs_and_no_later_one() {
     assert_eq!(rows[0][0].to_string(), "0");
 }
 
+/// SDB-359: a result nobody reads any more (an agent's read past its row cap) is stopped, and
+/// the statement sent right after it on the same session runs. The server keeps the session
+/// locked until it has ended the stopped request; the next one must not be refused for it
+/// (`SESSION_IS_LOCKED`), however soon it follows. Many times, because the server releases the
+/// session a moment after the client gives up on the request, and the next request races it.
+#[tokio::test]
+async fn a_statement_right_after_an_abandoned_result_runs() {
+    let Some(conn) = connect().await else { return };
+    let options = ExecOptions {
+        batch_size: 5,
+        ..Default::default()
+    };
+    for round in 0..40 {
+        let mut events = conn
+            .execute("SELECT number FROM system.numbers", &options)
+            .await
+            .unwrap_or_else(|e| panic!("round {round}: {e}"));
+        // The first rows, then the result is dropped, as the core does past a read's cap.
+        loop {
+            match events.try_next().await {
+                Ok(Some(ExecEvent::Batch(_))) => break,
+                Ok(Some(_)) => {}
+                other => panic!("round {round}: {other:?}"),
+            }
+        }
+        drop(events);
+        let started = Instant::now();
+        let (_, rows) = query(conn.as_ref(), &format!("SELECT {round}")).await;
+        assert_eq!(rows[0][0].to_string(), round.to_string());
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "round {round}: {:?}",
+            started.elapsed()
+        );
+    }
+    assert!(!conn.is_closed());
+}
+
+/// SDB-359: statements back to back on one session, with and without a result, and after a
+/// cancel: none is refused because the one before it still holds the session.
+#[tokio::test]
+async fn statements_back_to_back_on_one_session_never_find_it_locked() {
+    let Some(conn) = connect().await else { return };
+    for round in 0..300 {
+        let sql = match round % 3 {
+            0 => format!("SELECT {round}"),
+            1 => "SET max_threads = 2".to_string(),
+            _ => "SELECT number FROM numbers(1000) FORMAT TabSeparatedWithNamesAndTypes".into(),
+        };
+        run(conn.as_ref(), &sql)
+            .await
+            .unwrap_or_else(|e| panic!("round {round}: {sql}\n→ {e}"));
+    }
+    let cancel = conn.cancel_handle();
+    for round in 0..10 {
+        let (result, ()) = tokio::join!(
+            tokio::time::timeout(
+                Duration::from_secs(20),
+                run(conn.as_ref(), "SELECT count() FROM system.numbers"),
+            ),
+            async {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                cancel.cancel().await.unwrap();
+            }
+        );
+        let result = result.expect("the cancel was obeyed");
+        assert!(matches!(result, Err(DriverError::Cancelled)), "{result:?}");
+        let (_, rows) = query(conn.as_ref(), &format!("SELECT {round}")).await;
+        assert_eq!(rows[0][0].to_string(), round.to_string());
+    }
+    assert!(!conn.is_closed());
+}
+
 #[tokio::test]
 async fn bound_values_are_never_part_of_the_statement() {
     let Some(conn) = connect().await else { return };
