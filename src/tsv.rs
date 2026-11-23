@@ -83,6 +83,28 @@ pub fn unescape(field: &[u8]) -> Option<String> {
     Some(String::from_utf8_lossy(&out).into_owned())
 }
 
+/// A value as a `TabSeparated` field for an `INSERT … FORMAT TabSeparated` body: `\N` for NULL,
+/// and the characters that would end the field, the row or an escape written as escapes, so no
+/// value can make another field or row. [`unescape`] reads it back.
+pub fn escape(value: Option<&str>, out: &mut String) {
+    let Some(value) = value else {
+        out.push_str("\\N");
+        return;
+    };
+    for c in value.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '\t' => out.push_str("\\t"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\0' => out.push_str("\\0"),
+            '\u{8}' => out.push_str("\\b"),
+            '\u{c}' => out.push_str("\\f"),
+            other => out.push(other),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -118,5 +140,26 @@ mod tests {
     fn fields_split_on_tabs_only() {
         let got: Vec<&[u8]> = fields(b"1\t\\N\t").collect();
         assert_eq!(got, [&b"1"[..], b"\\N", b""]);
+    }
+
+    #[test]
+    fn escaped_values_stay_one_field_and_read_back() {
+        for value in [
+            None,
+            Some(""),
+            Some("plain"),
+            Some("\\N"),
+            Some("tab\there"),
+            Some("two\nlines\r\n"),
+            Some("back\\slash \\t not a tab"),
+            Some("nul\0 bell\u{7} bs\u{8} ff\u{c}"),
+            Some("ñandú 字 🦀 'quoted' \"too\""),
+        ] {
+            let mut field = String::new();
+            escape(value, &mut field);
+            assert!(!field.contains('\t') && !field.contains('\n'), "{field:?}");
+            assert_eq!(fields(field.as_bytes()).count(), 1, "{field:?}");
+            assert_eq!(unescape(field.as_bytes()).as_deref(), value, "{field:?}");
+        }
     }
 }
