@@ -41,6 +41,8 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["ring",
 [dev-dependencies]
 # The conformance set every plugin runs against its own program (tests/conformance.rs).
 spelaion-plugin-host = { git = "https://github.com/spelaion-dev/spelaiondb", tag = "plugin-sdk-v0.1.1" }
+# Escaped rows read back as written, whatever the values (src/tsv.rs).
+proptest = { version = "1", default-features = false, features = ["std"] }
 
 [lints.rust]
 unsafe_code = "forbid"

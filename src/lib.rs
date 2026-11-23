@@ -914,13 +914,7 @@ impl Connection for ClickhouseConnection {
         let mut body = String::new();
         let mut in_body = 0u64;
         for row in 0..rows.len() {
-            for (i, value) in rows.row(row).enumerate() {
-                if i > 0 {
-                    body.push('\t');
-                }
-                tsv::escape(value, &mut body);
-            }
-            body.push('\n');
+            tsv::push_row(rows.row(row), &mut body);
             in_body += 1;
             if body.len() >= MAX_INSERT_BODY || row + 1 == rows.len() {
                 let (reply, answer) = oneshot::channel();
