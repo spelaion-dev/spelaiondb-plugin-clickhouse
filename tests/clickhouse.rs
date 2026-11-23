@@ -11,8 +11,8 @@ use std::time::{Duration, Instant};
 
 use futures_util::TryStreamExt;
 use spelaion_driver_api::{
-    ConnectParams, Connection, Driver, DriverError, ExecEvent, ExecOptions, LogicalType,
-    ObjectKind, ResultSchema, Secret, TlsMode, Value,
+    ConnectParams, Connection, Driver, DriverError, ExecEvent, ExecOptions, InsertTarget,
+    LogicalType, ObjectKind, ResultSchema, Secret, TextRows, TlsMode, Value,
 };
 use spelaion_driver_clickhouse::ClickhouseDriver;
 
@@ -785,4 +785,163 @@ async fn a_database_that_is_not_there_is_a_connection_error() {
         ClickhouseDriver.connect(&p).await,
         Err(DriverError::Connection(_))
     ));
+}
+
+/// Imports (ADR-038, SDB-324): every value is data of `FORMAT TabSeparated`, never SQL text, and
+/// each stays in its own column whatever it holds.
+#[tokio::test]
+async fn imported_rows_are_data_and_land_whole() {
+    let Some(conn) = connect().await else { return };
+    let caps = conn.capabilities();
+    assert!(caps.insert_rows && caps.bound_params && caps.explain);
+    exec(&*conn, "DROP TABLE IF EXISTS import_rows").await;
+    exec(
+        &*conn,
+        "CREATE TABLE import_rows (id Int32, name Nullable(String), amount Decimal(10, 2), \
+         day Date, ok Bool) ENGINE = MergeTree ORDER BY id",
+    )
+    .await;
+    let target = InsertTarget {
+        schema: "spelaion".into(),
+        table: "import_rows".into(),
+        columns: ["id", "name", "amount", "day", "ok"]
+            .map(String::from)
+            .to_vec(),
+    };
+    let rows: Vec<Vec<Option<String>>> = [
+        ("1", Some("plain"), "10.50", "2024-01-02", "true"),
+        ("2", None, "0", "2024-02-29", "false"),
+        (
+            "3",
+            Some("tab\there\nand a line"),
+            "-3.25",
+            "1999-12-31",
+            "true",
+        ),
+        (
+            "4",
+            Some("x'); DROP TABLE import_rows; --"),
+            "1",
+            "2000-01-01",
+            "false",
+        ),
+        ("5", Some("\\N"), "2", "2000-01-02", "true"),
+        (
+            "6",
+            Some("back\\slash ñandú 🦀"),
+            "3",
+            "2000-01-03",
+            "false",
+        ),
+    ]
+    .into_iter()
+    .map(|(id, name, amount, day, ok)| {
+        vec![
+            Some(id.to_string()),
+            name.map(str::to_string),
+            Some(amount.to_string()),
+            Some(day.to_string()),
+            Some(ok.to_string()),
+        ]
+    })
+    .collect();
+    let inserted = conn
+        .insert_rows(&target, TextRows::from_rows(5, &rows).unwrap())
+        .await
+        .expect("inserts");
+    assert_eq!(inserted, 6);
+    let (_, got) = query(
+        &*conn,
+        "SELECT id, name, toString(amount), toString(day), ok FROM import_rows ORDER BY id",
+    )
+    .await;
+    let text = |v: &Value| match v {
+        Value::Null => None,
+        other => Some(other.to_string()),
+    };
+    let got: Vec<Vec<Option<String>>> = got
+        .iter()
+        .map(|row| row.iter().map(text).collect())
+        .collect();
+    assert_eq!(got[2][1].as_deref(), Some("tab\there\nand a line"));
+    assert_eq!(
+        got[3][1].as_deref(),
+        Some("x'); DROP TABLE import_rows; --")
+    );
+    assert_eq!(got[1][1], None, "a NULL stays NULL");
+    assert_eq!(
+        got[4][1].as_deref(),
+        Some("\\N"),
+        "the text \\N is not NULL"
+    );
+    assert_eq!(got[5][1].as_deref(), Some("back\\slash ñandú 🦀"));
+    assert_eq!(got[0][2].as_deref(), Some("10.5"));
+    assert_eq!(got[1][3].as_deref(), Some("2024-02-29"));
+
+    // A NULL where the column cannot hold one is refused, not turned into the column's default.
+    let null_id = TextRows::from_rows(
+        5,
+        &[vec![
+            None,
+            Some("x".into()),
+            Some("1".into()),
+            Some("2000-01-01".into()),
+            Some("true".into()),
+        ]],
+    )
+    .unwrap();
+    assert!(conn.insert_rows(&target, null_id).await.is_err());
+    // A value the column cannot read is the server's error; the session goes on.
+    let bad = TextRows::from_rows(
+        5,
+        &[vec![
+            Some("7".into()),
+            None,
+            Some("not a number".into()),
+            Some("2000-01-01".into()),
+            Some("true".into()),
+        ]],
+    )
+    .unwrap();
+    assert!(conn.insert_rows(&target, bad).await.is_err());
+    let (_, count) = query(&*conn, "SELECT count() FROM import_rows").await;
+    assert_eq!(count[0][0].to_string(), "6");
+
+    // Many rows go in several requests.
+    let many: Vec<Vec<Option<String>>> = (100..20_100)
+        .map(|n| {
+            vec![
+                Some(n.to_string()),
+                Some("x".repeat(500)),
+                Some("1".into()),
+                Some("2000-01-01".into()),
+                Some("true".into()),
+            ]
+        })
+        .collect();
+    let inserted = conn
+        .insert_rows(&target, TextRows::from_rows(5, &many).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(inserted, 20_000);
+    let (_, count) = query(&*conn, "SELECT count() FROM import_rows").await;
+    assert_eq!(count[0][0].to_string(), "20006");
+    exec(&*conn, "DROP TABLE import_rows").await;
+}
+
+/// `EXPLAIN json = 1` answers one row whose one value is the plan as JSON: what SpelaionDB's
+/// plan view reads (SDB-324).
+#[tokio::test]
+async fn explain_answers_the_plan_as_json() {
+    let Some(conn) = connect().await else { return };
+    let (schema, rows) = query(
+        &*conn,
+        "EXPLAIN json = 1, indexes = 1, actions = 1 SELECT number FROM system.numbers LIMIT 3",
+    )
+    .await;
+    assert_eq!(schema.columns.len(), 1);
+    assert_eq!(rows.len(), 1);
+    let text = rows[0][0].to_string();
+    let plan: serde_json::Value = serde_json::from_str(&text).expect("JSON");
+    assert!(plan[0]["Plan"]["Node Type"].is_string(), "{text}");
 }

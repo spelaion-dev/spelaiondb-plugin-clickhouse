@@ -68,6 +68,9 @@ const ABANDONED_FOR: Duration = Duration::from_secs(10);
 /// The most an internal query's result may take.
 const MAX_ROWS_BODY: usize = 256 * 1024 * 1024;
 
+/// The most rows of an import one request carries, in bytes of `TabSeparated` text.
+const MAX_INSERT_BODY: usize = 8 * 1024 * 1024;
+
 /// The `clickhouse` engine.
 #[derive(Debug, Default, Clone)]
 pub struct ClickhouseDriver;
@@ -139,13 +142,14 @@ impl Driver for ClickhouseDriver {
             capabilities: Capabilities {
                 transactions: false,
                 cancel: true,
-                explain: false,
+                // SpelaionDB reads `EXPLAIN json = 1` into its plan view (SDB-324).
+                explain: true,
                 editable_results: false,
                 schemas: true,
-                insert_rows: false,
-                // `execute_bound` works (`{p1:String}`), but SpelaionDB's data search does not
-                // write ClickHouse's SQL yet: it stays hidden until it does.
-                bound_params: false,
+                insert_rows: true,
+                // `execute_bound` binds `{p1:String}`, which SpelaionDB's data search writes
+                // for ClickHouse (SDB-324).
+                bound_params: true,
             },
             requests,
             cancel,
@@ -209,6 +213,30 @@ impl Session {
         let response = self.client.send(&borrowed, sql.to_string()).await?;
         self.checked = true;
         Ok(response)
+    }
+
+    /// Runs `statement` (an `INSERT … FORMAT TabSeparated`) with `rows` as its data: the
+    /// statement goes in the `query` parameter and the rows are the body, so ClickHouse reads
+    /// them as data in that format and never as SQL. A NULL for a column that cannot hold one
+    /// is an error, not the column's default.
+    async fn insert(&mut self, statement: &str, rows: String) -> Result<()> {
+        let params = self.params(&[("query", statement), ("input_format_null_as_default", "0")]);
+        let params: Vec<(String, String)> = params
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let borrowed: Vec<(&str, &str)> = params
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        let response = self.client.send(&borrowed, rows).await?;
+        self.checked = true;
+        // The answer is empty; read it to the end so the connection can be used again.
+        let mut body = response.into_body();
+        while let Some(frame) = body.frame().await {
+            frame.map_err(|e| DriverError::Connection(format!("the answer was cut: {e}")))?;
+        }
+        Ok(())
     }
 
     /// A whole result as text: what the driver's own queries read.
@@ -313,6 +341,13 @@ enum Request {
         params: Vec<(String, String)>,
         reply: oneshot::Sender<Result<Vec<Vec<Option<String>>>>>,
     },
+    /// An `INSERT … FORMAT TabSeparated` statement and the rows it reads, kept apart: the rows
+    /// travel as the request's body, never as SQL text.
+    Insert {
+        statement: String,
+        rows: String,
+        reply: oneshot::Sender<Result<()>>,
+    },
 }
 
 /// The session's requests, one at a time, and a touch when it is idle.
@@ -359,6 +394,17 @@ async fn actor(
                     .map(|(k, v)| (k.as_str(), v.as_str()))
                     .collect();
                 let result = session.rows(&sql, &borrowed).await;
+                if let Err(e) = &result {
+                    mark_lost(e, &closed);
+                }
+                let _ = reply.send(result);
+            }
+            Request::Insert {
+                statement,
+                rows,
+                reply,
+            } => {
+                let result = session.insert(&statement, rows).await;
                 if let Err(e) = &result {
                     mark_lost(e, &closed);
                 }
@@ -838,6 +884,60 @@ impl Connection for ClickhouseConnection {
         opts: &ExecOptions,
     ) -> Result<EventStream> {
         self.run(sql, params, opts).await
+    }
+
+    /// `INSERT INTO table (columns) FORMAT TabSeparated`, with the rows in the request's body
+    /// (ADR-038): only the quoted names are SQL text, every value is data in that format,
+    /// escaped so it stays one field ([`tsv::escape`]). The rows go in requests of at most
+    /// [`MAX_INSERT_BODY`] bytes. ClickHouse has no transactions: a failed request leaves the
+    /// requests before it inserted, as the import's progress says.
+    async fn insert_rows(
+        &self,
+        target: &spelaion_driver_api::InsertTarget,
+        rows: spelaion_driver_api::TextRows,
+    ) -> Result<u64> {
+        target.check_rows(&rows)?;
+        if self.closed.load(Ordering::SeqCst) {
+            return Err(Self::gone());
+        }
+        let table = if target.schema.is_empty() {
+            quote(&target.table)
+        } else {
+            format!("{}.{}", quote(&target.schema), quote(&target.table))
+        };
+        let columns: Vec<String> = target.columns.iter().map(|c| quote(c)).collect();
+        let statement = format!(
+            "INSERT INTO {table} ({}) FORMAT TabSeparated",
+            columns.join(", ")
+        );
+        let mut inserted = 0u64;
+        let mut body = String::new();
+        let mut in_body = 0u64;
+        for row in 0..rows.len() {
+            for (i, value) in rows.row(row).enumerate() {
+                if i > 0 {
+                    body.push('\t');
+                }
+                tsv::escape(value, &mut body);
+            }
+            body.push('\n');
+            in_body += 1;
+            if body.len() >= MAX_INSERT_BODY || row + 1 == rows.len() {
+                let (reply, answer) = oneshot::channel();
+                self.requests
+                    .send(Request::Insert {
+                        statement: statement.clone(),
+                        rows: std::mem::take(&mut body),
+                        reply,
+                    })
+                    .await
+                    .map_err(|_| Self::gone())?;
+                answer.await.map_err(|_| Self::gone())??;
+                inserted += in_body;
+                in_body = 0;
+            }
+        }
+        Ok(inserted)
     }
 
     fn cancel_handle(&self) -> Arc<dyn CancelHandle> {
