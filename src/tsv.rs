@@ -5,6 +5,8 @@
 //! and the others below inside a value, `\N` for NULL. Undoing that escape gives back the
 //! server's text exactly.
 
+use spelaion_driver_api::Cell;
+
 /// Complete lines out of bytes that arrive in pieces.
 #[derive(Default)]
 pub struct Lines {
@@ -58,6 +60,14 @@ pub fn unescape(field: &[u8]) -> Option<String> {
     if !field.contains(&b'\\') {
         return Some(String::from_utf8_lossy(field).into_owned());
     }
+    unescape_bytes(field).map(|out| String::from_utf8_lossy(&out).into_owned())
+}
+
+/// A field's bytes, `None` for NULL: what [`escape_bytes`] wrote.
+pub fn unescape_bytes(field: &[u8]) -> Option<Vec<u8>> {
+    if field == b"\\N" {
+        return None;
+    }
     let mut out = Vec::with_capacity(field.len());
     let mut bytes = field.iter().copied();
     while let Some(b) = bytes.next() {
@@ -80,41 +90,52 @@ pub fn unescape(field: &[u8]) -> Option<String> {
             None => out.push(b'\\'),
         }
     }
-    Some(String::from_utf8_lossy(&out).into_owned())
+    Some(out)
 }
 
 /// A value as a `TabSeparated` field for an `INSERT … FORMAT TabSeparated` body: `\N` for NULL,
 /// and the characters that would end the field, the row or an escape written as escapes, so no
 /// value can make another field or row. [`unescape`] reads it back.
-pub fn escape(value: Option<&str>, out: &mut String) {
-    let Some(value) = value else {
-        out.push_str("\\N");
-        return;
-    };
-    for c in value.chars() {
-        match c {
-            '\\' => out.push_str("\\\\"),
-            '\t' => out.push_str("\\t"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\0' => out.push_str("\\0"),
-            '\u{8}' => out.push_str("\\b"),
-            '\u{c}' => out.push_str("\\f"),
+pub fn escape(value: Option<&str>, out: &mut Vec<u8>) {
+    match value {
+        None => out.extend_from_slice(b"\\N"),
+        Some(text) => escape_bytes(text.as_bytes(), out),
+    }
+}
+
+/// Bytes as a `TabSeparated` field (ClickHouse's `String` holds any bytes, SDB-464): each byte
+/// that would end the field, the row or an escape written as an escape, every other as it is.
+/// Text is escaped the same way, byte by byte: every escaped character is ASCII, and no byte of
+/// another UTF-8 character is one of them. [`unescape_bytes`] reads it back.
+pub fn escape_bytes(value: &[u8], out: &mut Vec<u8>) {
+    for &byte in value {
+        match byte {
+            b'\\' => out.extend_from_slice(b"\\\\"),
+            b'\t' => out.extend_from_slice(b"\\t"),
+            b'\n' => out.extend_from_slice(b"\\n"),
+            b'\r' => out.extend_from_slice(b"\\r"),
+            0 => out.extend_from_slice(b"\\0"),
+            0x08 => out.extend_from_slice(b"\\b"),
+            0x0c => out.extend_from_slice(b"\\f"),
             other => out.push(other),
         }
     }
 }
 
-/// A row as a line of a `TabSeparated` body: its values [`escape`]d, a tab between them and a
-/// line end after the last.
-pub fn push_row<'a>(values: impl Iterator<Item = Option<&'a str>>, out: &mut String) {
+/// A row as a line of a `TabSeparated` body: its values escaped ([`escape`], [`escape_bytes`]),
+/// a tab between them and a line end after the last.
+pub fn push_row<'a>(values: impl Iterator<Item = Option<Cell<'a>>>, out: &mut Vec<u8>) {
     for (i, value) in values.enumerate() {
         if i > 0 {
-            out.push('\t');
+            out.push(b'\t');
         }
-        escape(value, out);
+        match value {
+            None => out.extend_from_slice(b"\\N"),
+            Some(Cell::Text(text)) => escape_bytes(text.as_bytes(), out),
+            Some(Cell::Bytes(bytes)) => escape_bytes(bytes, out),
+        }
     }
-    out.push('\n');
+    out.push(b'\n');
 }
 
 #[cfg(test)]
@@ -125,18 +146,18 @@ mod tests {
     type Row = Vec<Option<String>>;
 
     /// `rows` as the body of an insert.
-    fn body(rows: &[Row]) -> String {
-        let mut out = String::new();
+    fn body(rows: &[Row]) -> Vec<u8> {
+        let mut out = Vec::new();
         for row in rows {
-            push_row(row.iter().map(Option::as_deref), &mut out);
+            push_row(row.iter().map(|v| v.as_deref().map(Cell::Text)), &mut out);
         }
         out
     }
 
     /// A body read back as the server reads it: a row per line, a value per field.
-    fn read_back(body: &str) -> Vec<Row> {
+    fn read_back(body: &[u8]) -> Vec<Row> {
         let mut lines = Lines::default();
-        lines.push(body.as_bytes());
+        lines.push(body);
         let mut rows = Vec::new();
         while let Some(line) = lines.next_line() {
             rows.push(fields(line).map(unescape).collect());
@@ -173,6 +194,22 @@ mod tests {
             let back = read_back(&body(&rows));
             prop_assert_eq!(back, rows);
         }
+
+        /// Whatever the bytes (SDB-464), they stay one field of one line and read back as the
+        /// same bytes.
+        #[test]
+        fn any_bytes_read_back_as_written(
+            values in prop::collection::vec(prop::option::of(any::<Vec<u8>>()), 1..6)
+        ) {
+            let mut line = Vec::new();
+            push_row(values.iter().map(|v| v.as_deref().map(Cell::Bytes)), &mut line);
+            let mut lines = Lines::default();
+            lines.push(&line);
+            let row = lines.next_line().expect("one line");
+            let back: Vec<Option<Vec<u8>>> = fields(row).map(unescape_bytes).collect();
+            prop_assert_eq!(back, values);
+            prop_assert!(lines.next_line().is_none());
+        }
     }
 
     #[test]
@@ -194,7 +231,7 @@ mod tests {
         assert_eq!(read_back(&body(&rows)), rows);
         // A single empty value is an empty line, not no row.
         let one: Vec<Row> = vec![vec![Some(String::new())], vec![None]];
-        assert_eq!(body(&one), "\n\\N\n");
+        assert_eq!(body(&one), b"\n\\N\n");
         assert_eq!(read_back(&body(&one)), one);
     }
 
@@ -244,11 +281,14 @@ mod tests {
             Some("nul\0 bell\u{7} bs\u{8} ff\u{c}"),
             Some("ñandú 字 🦀 'quoted' \"too\""),
         ] {
-            let mut field = String::new();
+            let mut field = Vec::new();
             escape(value, &mut field);
-            assert!(!field.contains('\t') && !field.contains('\n'), "{field:?}");
-            assert_eq!(fields(field.as_bytes()).count(), 1, "{field:?}");
-            assert_eq!(unescape(field.as_bytes()).as_deref(), value, "{field:?}");
+            assert!(
+                !field.contains(&b'\t') && !field.contains(&b'\n'),
+                "{field:?}"
+            );
+            assert_eq!(fields(&field).count(), 1, "{field:?}");
+            assert_eq!(unescape(&field).as_deref(), value, "{field:?}");
         }
     }
 }
