@@ -147,6 +147,8 @@ impl Driver for ClickhouseDriver {
                 editable_results: false,
                 schemas: true,
                 insert_rows: true,
+                // A `String` column takes bytes as they are, escaped in the body (SDB-464).
+                insert_bytes: true,
                 // `execute_bound` binds `{p1:String}`, which SpelaionDB's data search writes
                 // for ClickHouse (SDB-324).
                 bound_params: true,
@@ -219,7 +221,7 @@ impl Session {
     /// statement goes in the `query` parameter and the rows are the body, so ClickHouse reads
     /// them as data in that format and never as SQL. A NULL for a column that cannot hold one
     /// is an error, not the column's default.
-    async fn insert(&mut self, statement: &str, rows: String) -> Result<()> {
+    async fn insert(&mut self, statement: &str, rows: Vec<u8>) -> Result<()> {
         let params = self.params(&[("query", statement), ("input_format_null_as_default", "0")]);
         let params: Vec<(String, String)> = params
             .into_iter()
@@ -345,7 +347,8 @@ enum Request {
     /// travel as the request's body, never as SQL text.
     Insert {
         statement: String,
-        rows: String,
+        /// The `TabSeparated` body: bytes, since a `String` column takes any (SDB-464).
+        rows: Vec<u8>,
         reply: oneshot::Sender<Result<()>>,
     },
 }
@@ -911,10 +914,10 @@ impl Connection for ClickhouseConnection {
             columns.join(", ")
         );
         let mut inserted = 0u64;
-        let mut body = String::new();
+        let mut body = Vec::new();
         let mut in_body = 0u64;
         for row in 0..rows.len() {
-            tsv::push_row(rows.row(row), &mut body);
+            tsv::push_row(rows.cells(row), &mut body);
             in_body += 1;
             if body.len() >= MAX_INSERT_BODY || row + 1 == rows.len() {
                 let (reply, answer) = oneshot::channel();

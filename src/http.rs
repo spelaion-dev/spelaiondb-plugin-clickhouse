@@ -170,7 +170,11 @@ impl Endpoint {
         }
     }
 
-    fn request(&self, params: &[(&str, &str)], body: String) -> Result<Request<Full<Bytes>>> {
+    fn request(
+        &self,
+        params: &[(&str, &str)],
+        body: impl Into<Bytes>,
+    ) -> Result<Request<Full<Bytes>>> {
         let mut path = String::from("/?");
         for (i, (name, value)) in params.iter().enumerate() {
             if i > 0 {
@@ -198,7 +202,7 @@ impl Endpoint {
             builder = builder.header("X-ClickHouse-Key", password.expose());
         }
         builder
-            .body(Full::new(Bytes::from(body)))
+            .body(Full::new(body.into()))
             .map_err(|e| DriverError::Other(format!("HTTP request: {e}")))
     }
 }
@@ -228,7 +232,7 @@ impl Client {
     pub async fn send(
         &mut self,
         params: &[(&str, &str)],
-        body: String,
+        body: impl Into<Bytes>,
     ) -> Result<Response<Incoming>> {
         let request = self.endpoint.request(params, body)?;
         let reusable = match &mut self.open {
@@ -278,7 +282,7 @@ impl Client {
 pub async fn send_alone(
     endpoint: &Arc<Endpoint>,
     params: &[(&str, &str)],
-    body: String,
+    body: impl Into<Bytes>,
 ) -> Result<Vec<u8>> {
     let mut client = Client::new(endpoint.clone());
     let response = client.send(params, body).await?;

@@ -945,3 +945,58 @@ async fn explain_answers_the_plan_as_json() {
     let plan: serde_json::Value = serde_json::from_str(&text).expect("JSON");
     assert!(plan[0]["Plan"]["Node Type"].is_string(), "{text}");
 }
+
+/// A column of bytes loads every byte as it is into a `String` and a `FixedString`, escaped in
+/// the body, the empty bytes and NULL apart, as the server's own `hex` reads them (SDB-464).
+#[tokio::test]
+async fn insert_rows_loads_bytes_as_they_are() {
+    use spelaion_driver_api::{Cell, ColumnKind};
+    let Some(conn) = connect().await else { return };
+    assert!(conn.capabilities().insert_bytes);
+    exec(&*conn, "DROP TABLE IF EXISTS import_bytes").await;
+    exec(
+        &*conn,
+        "CREATE TABLE import_bytes (id Int32, data Nullable(String), \
+         fixed Nullable(FixedString(256))) ENGINE = MergeTree ORDER BY id",
+    )
+    .await;
+    let every: Vec<u8> = (0..=255).collect();
+    let kinds = [ColumnKind::Text, ColumnKind::Bytes, ColumnKind::Bytes];
+    let mut rows = TextRows::builder_with(&kinds);
+    rows.push_cells([
+        Some(Cell::Text("1")),
+        Some(Cell::Bytes(&every)),
+        Some(Cell::Bytes(&every)),
+    ])
+    .unwrap();
+    rows.push_cells([Some(Cell::Text("2")), Some(Cell::Bytes(&[])), None])
+        .unwrap();
+    rows.push_cells([Some(Cell::Text("3")), None, None])
+        .unwrap();
+    let target = InsertTarget {
+        schema: "spelaion".into(),
+        table: "import_bytes".into(),
+        columns: ["id", "data", "fixed"].map(String::from).to_vec(),
+    };
+    assert_eq!(conn.insert_rows(&target, rows.finish()).await.unwrap(), 3);
+    let (_, got) = query(
+        &*conn,
+        "SELECT id, ifNull(lower(hex(data)), 'NULL'), ifNull(lower(hex(fixed)), 'NULL') \
+         FROM import_bytes ORDER BY id",
+    )
+    .await;
+    let got: Vec<Vec<String>> = got
+        .iter()
+        .map(|row| row.iter().map(Value::to_string).collect())
+        .collect();
+    let hex: String = every.iter().map(|b| format!("{b:02x}")).collect();
+    assert_eq!(
+        got,
+        [
+            vec!["1".to_string(), hex.clone(), hex],
+            vec!["2".into(), String::new(), "NULL".into()],
+            vec!["3".into(), "NULL".into(), "NULL".into()],
+        ]
+    );
+    exec(&*conn, "DROP TABLE import_bytes").await;
+}
